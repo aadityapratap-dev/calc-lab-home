@@ -131,7 +131,12 @@ typedef struct {
     PowItem *chain;
     size_t chain_cap;
     size_t chain_top;
+    size_t depth;  // how many opening brackets are currently open
 } Parser;
+
+// Every bracket level uses several nested function calls (expr, term, power,
+// primary), so without a limit a line of endless ( would run out of stack.
+#define MAX_DEPTH 4000
 
 // Only the first error counts, everything after it is just unwinding.
 static void fail(Parser *p, size_t idx) {
@@ -285,8 +290,14 @@ static Value parse_primary(Parser *p) {
         return mk_int((long long)n);
     }
     if (c == '(') {
+        if (p->depth >= MAX_DEPTH) {
+            fail(p, p->pos);
+            return mk_int(0);
+        }
         p->pos++;
+        p->depth++;
         Value v = parse_expr(p);
+        p->depth--;
         if (p->err) return v;
         skip_ws(p);
         // Anything except a closing bracket is wrong, at the end of the line
@@ -385,7 +396,7 @@ static Value parse_expr(Parser *p) {
 // Evaluates the whole file. The file is one flat buffer that is read once from
 // start to end and never copied, so size and line length do not matter.
 static void run_file(char *text, size_t len, Buf *out) {
-    Parser p = {text, len, 0, 0, NULL, 0, 0};
+    Parser p = {text, len, 0, 0, NULL, 0, 0, 0};
     while (p.pos < p.len) {
         skip_ws(&p);
         if (at_eol(&p)) {  // blank line, nothing to output
