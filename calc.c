@@ -1,7 +1,7 @@
 // Aadityapratap Singh Baghel 241ADB122
 // https://github.com/aadityapratap-dev/calc-lab-home
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
-// Resources used: Claude (Anthropic), conversation history: https://github.com/aadityapratap-dev/calc-lab-home
+// Resources used: Claude (Anthropic), conversation history: https://claude.ai/share/2670234a-0309-4c38-bbf2-7ca8fb874aad
 
 // calc reads arithmetic expressions from text files and writes one result per
 // line (or the position of the first error) into an output file.
