@@ -169,7 +169,7 @@ static unsigned long long ipow(unsigned long long base, unsigned long long e) {
     return result;
 }
 
-// op is + - * / or p for **. op_idx is where the operator starts and rhs_idx is
+// op is plus, minus, times, divide or p for **. op_idx is where the operator starts and rhs_idx is
 // where the right operand starts, because the task wants different errors at
 // different places: division by zero and a negative exponent point at the right
 // operand, since that operand is what is wrong, while a float result that is
@@ -178,7 +178,7 @@ static unsigned long long ipow(unsigned long long base, unsigned long long e) {
 static Value apply(Parser *p, char op, Value a, Value b, size_t op_idx, size_t rhs_idx) {
     if (a.is_float || b.is_float) {
         // One float anywhere means the whole operation is done in double,
-        // which is how 7 / 2.0 becomes 3.5 and 0.5 ** (0 - 1) becomes 2.
+        // which is how 7 / 2.0 becomes 3.5 and 0.5 to the power of minus one becomes 2.
         double x = as_double(a), y = as_double(b), r = 0.0;
         switch (op) {
         case '+': r = x + y; break;
@@ -193,7 +193,7 @@ static Value apply(Parser *p, char op, Value a, Value b, size_t op_idx, size_t r
             break;
         default: r = pow(x, y); break;
         }
-        // Overflow gives infinity and something like (-8) ** 0.5 gives NaN.
+        // Overflow gives infinity and a negative number to the power 0.5 gives NaN.
         // Neither can be printed as a result, so they are errors.
         if (!isfinite(r)) {
             fail(p, op_idx);
@@ -366,7 +366,7 @@ static Value parse_term(Parser *p) {
     return l;
 }
 
-// Same loop for + and -, one level looser than term.
+// Same loop for plus and minus, one level looser than term.
 static Value parse_expr(Parser *p) {
     Value l = parse_term(p);
     while (!p->err) {
