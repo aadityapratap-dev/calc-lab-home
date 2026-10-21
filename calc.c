@@ -61,9 +61,7 @@ static void buf_add(Buf *b, const char *s, size_t n) {
 }
 
 // AI (Claude): prompt "read a whole file into memory in C without knowing its size"
-// Used the idea of growing the buffer by doubling with realloc. Doubling means
-// a huge file is copied only a handful of times in total, not once per chunk.
-// One spare byte at the end holds a NUL so strtod can stop safely later.
+// The spare byte makes s[len] writable, parse_primary may put a temporary NUL there.
 static char *read_file(const char *path, size_t *len_out) {
     FILE *f = fopen(path, "rb");
     if (f == NULL) return NULL;
@@ -157,8 +155,7 @@ static int at_pow(Parser *p) {
 // ===== arithmetic =====
 
 // AI (Claude): prompt "fast integer power in C that cannot hit undefined behaviour on overflow"
-// Squaring the base only while bits of the exponent are left keeps 1 ** 1000000000
-// down to about 30 steps. Unsigned maths wraps instead of being undefined.
+// Squaring per exponent bit keeps 1 ** 1000000000 at about 30 steps, unsigned maths wraps.
 static unsigned long long ipow(unsigned long long base, unsigned long long e) {
     unsigned long long result = 1;
     while (e) {
@@ -169,12 +166,12 @@ static unsigned long long ipow(unsigned long long base, unsigned long long e) {
     return result;
 }
 
-// op is plus, minus, times, divide or p for **. op_idx is where the operator starts and rhs_idx is
-// where the right operand starts, because the task wants different errors at
-// different places: division by zero and a negative exponent point at the right
-// operand, since that operand is what is wrong, while a float result that is
-// infinite or not a number points at the operator, since the operation as a
-// whole produced it.
+// op is plus, minus, times, divide or p for **. op_idx is where the operator
+// starts and rhs_idx is where the right operand starts, because the task wants
+// different errors at different places: division by zero and a negative
+// exponent point at the right operand, since that operand is what is wrong,
+// while a float result that is infinite or not a number points at the
+// operator, since the operation as a whole produced it.
 static Value apply(Parser *p, char op, Value a, Value b, size_t op_idx, size_t rhs_idx) {
     if (a.is_float || b.is_float) {
         // One float anywhere means the whole operation is done in double,
