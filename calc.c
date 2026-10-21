@@ -497,10 +497,118 @@ static int process_file(const char *in_path, const char *out_dir) {
     return rc;
 }
 
+// Joins a folder and a file name with exactly one slash between them.
+static char *join_path(const char *dir, const char *name) {
+    size_t n = strlen(dir);
+    const char *sep = (n > 0 && dir[n - 1] == '/') ? "" : "/";
+    int len = snprintf(NULL, 0, "%s%s%s", dir, sep, name);
+    char *out = xrealloc(NULL, (size_t)len + 1);
+    snprintf(out, (size_t)len + 1, "%s%s%s", dir, sep, name);
+    return out;
+}
+
+static int ends_with_txt(const char *name) {
+    size_t n = strlen(name);
+    return n > 4 && strcmp(name + n - 4, ".txt") == 0;
+}
+
+static int cmp_paths(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+// Evaluates every *.txt file directly inside dir. Other files and sub folders
+// are skipped (stat, not the name, decides, so a folder called x.txt is skipped
+// too). All paths are collected before anything is written, so result files
+// that land in the same folder are never picked up as input in this run.
+// Sorting makes the order the same on every machine, readdir has no order.
+static int process_dir(const char *dir, const char *out_dir) {
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        fprintf(stderr, "calc: cannot open folder '%s': %s\n", dir, strerror(errno));
+        return -1;
+    }
+    char **paths = NULL;
+    size_t count = 0, cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!ends_with_txt(e->d_name)) continue;
+        char *full = join_path(dir, e->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
+            free(full);
+            continue;
+        }
+        if (count == cap) {
+            cap = cap ? cap * 2 : 16;
+            paths = xrealloc(paths, cap * sizeof *paths);
+        }
+        paths[count++] = full;
+    }
+    closedir(d);
+    if (count > 1) qsort(paths, count, sizeof *paths, cmp_paths);
+
+    int rc = ensure_dir(out_dir);
+    for (size_t k = 0; k < count; k++) {
+        // One bad file should not stop the others, but the exit code must say
+        // that something went wrong.
+        if (rc == 0 && process_file(paths[k], out_dir) != 0) rc = -1;
+        free(paths[k]);
+    }
+    free(paths);
+    return rc;
+}
+
+static void usage(void) {
+    fprintf(stderr, "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
+}
+
 int main(int argc, char **argv) {
-    if (argc != 4 || strcmp(argv[1], "-o") != 0) {
-        fprintf(stderr, "usage: calc -o OUTDIR input.txt\n");
+    const char *dir = NULL, *out_dir = NULL, *input = NULL;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        int is_dir_opt = strcmp(a, "-d") == 0 || strcmp(a, "--dir") == 0;
+        int is_out_opt = strcmp(a, "-o") == 0 || strcmp(a, "--output-dir") == 0;
+        if (is_dir_opt || is_out_opt) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "calc: option '%s' needs a value\n", a);
+                usage();
+                return 2;
+            }
+            if (is_dir_opt) dir = argv[++i];
+            else out_dir = argv[++i];
+        } else if (a[0] == '-') {
+            fprintf(stderr, "calc: unknown option '%s'\n", a);
+            usage();
+            return 2;
+        } else if (input != NULL) {
+            fprintf(stderr, "calc: only one input file is allowed\n");
+            usage();
+            return 2;
+        } else {
+            input = a;
+        }
+    }
+    // Exactly one of a folder or a single file is needed. This also catches the
+    // call with no arguments at all.
+    if ((dir == NULL) == (input == NULL)) {
+        usage();
         return 2;
     }
-    return process_file(argv[3], argv[2]) == 0 ? 0 : 1;
+
+    // Without an output folder given, use <input_base>_<name>_<studentid> in the
+    // current folder. For a single file the base has no .txt, for a folder it is
+    // the folder's own name.
+    char *default_out = NULL;
+    if (out_dir == NULL) {
+        char *base = make_base(dir != NULL ? dir : input, dir == NULL);
+        int n = snprintf(NULL, 0, "%s_" STUDENT_NAME "_" STUDENT_ID, base);
+        default_out = xrealloc(NULL, (size_t)n + 1);
+        snprintf(default_out, (size_t)n + 1, "%s_" STUDENT_NAME "_" STUDENT_ID, base);
+        free(base);
+        out_dir = default_out;
+    }
+
+    int rc = dir != NULL ? process_dir(dir, out_dir) : process_file(input, out_dir);
+    free(default_out);
+    return rc == 0 ? 0 : 1;
 }
