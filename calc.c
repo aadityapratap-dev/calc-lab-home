@@ -90,9 +90,26 @@ static char *read_file(const char *path, size_t *len_out) {
 
 // ===== values =====
 
-typedef long long Value;
+// Every value remembers whether it is an integer or a float. That decides how
+// the next operation is done: if either operand is a float the whole operation
+// runs in double, otherwise it stays in exact 64 bit integers.
+typedef struct {
+    int is_float;
+    long long i;
+    double d;
+} Value;
 
-static Value mk_int(long long n) { return n; }
+static Value mk_int(long long n) {
+    Value v = {0, n, 0.0};
+    return v;
+}
+
+static Value mk_float(double d) {
+    Value v = {1, 0, d};
+    return v;
+}
+
+static double as_double(Value v) { return v.is_float ? v.d : (double)v.i; }
 
 // ===== parser state =====
 
@@ -155,32 +172,60 @@ static unsigned long long ipow(unsigned long long base, unsigned long long e) {
 // op is + - * / or p for **. op_idx is where the operator starts and rhs_idx is
 // where the right operand starts, because the task wants different errors at
 // different places: division by zero and a negative exponent point at the right
-// operand, since that operand is what is wrong.
+// operand, since that operand is what is wrong, while a float result that is
+// infinite or not a number points at the operator, since the operation as a
+// whole produced it.
 static Value apply(Parser *p, char op, Value a, Value b, size_t op_idx, size_t rhs_idx) {
-    (void)op_idx;
-    unsigned long long x = (unsigned long long)a, y = (unsigned long long)b;
+    if (a.is_float || b.is_float) {
+        // One float anywhere means the whole operation is done in double,
+        // which is how 7 / 2.0 becomes 3.5 and 0.5 ** (0 - 1) becomes 2.
+        double x = as_double(a), y = as_double(b), r = 0.0;
+        switch (op) {
+        case '+': r = x + y; break;
+        case '-': r = x - y; break;
+        case '*': r = x * y; break;
+        case '/':
+            if (y == 0.0) {
+                fail(p, rhs_idx);
+                return a;
+            }
+            r = x / y;
+            break;
+        default: r = pow(x, y); break;
+        }
+        // Overflow gives infinity and something like (-8) ** 0.5 gives NaN.
+        // Neither can be printed as a result, so they are errors.
+        if (!isfinite(r)) {
+            fail(p, op_idx);
+            return a;
+        }
+        return mk_float(r);
+    }
+    // Both operands are integers here, so the exact integer rules apply.
+    unsigned long long x = (unsigned long long)a.i, y = (unsigned long long)b.i;
     switch (op) {
-    case '+': return (Value)(x + y);
-    case '-': return (Value)(x - y);
-    case '*': return (Value)(x * y);
+    case '+': return mk_int((long long)(x + y));
+    case '-': return mk_int((long long)(x - y));
+    case '*': return mk_int((long long)(x * y));
     case '/':
-        if (b == 0) {
+        if (b.i == 0) {
             fail(p, rhs_idx);
-            return 0;
+            return a;
         }
-        if (a == LL_MIN && b == -1) return a;  // the one division that overflows in C
-        return a / b;                          // C truncates toward zero, same as the task
+        if (a.i == LL_MIN && b.i == -1) return a;  // the one division that overflows in C
+        return mk_int(a.i / b.i);                  // C truncates toward zero, same as the task
     default:
-        if (b < 0) {
+        if (b.i < 0) {  // int ** negative int would not be an integer
             fail(p, rhs_idx);
-            return 0;
+            return a;
         }
-        return (Value)ipow(x, y);
+        return mk_int((long long)ipow(x, y));
     }
 }
 
 static int format_value(char *out, size_t cap, Value v) {
-    return snprintf(out, cap, "%lld\n", v);
+    if (v.is_float) return snprintf(out, cap, "%.15g\n", v.d);
+    return snprintf(out, cap, "%lld\n", v.i);
 }
 
 // ===== parser =====
@@ -209,11 +254,37 @@ static Value parse_primary(Parser *p) {
     }
     char c = p->s[p->pos];
     if (is_digit(c)) {
-        unsigned long long n = 0;
-        while (p->pos < p->len && is_digit(p->s[p->pos])) {
-            n = n * 10 + (unsigned long long)(p->s[p->pos] - '0');
-            p->pos++;
+        size_t start = p->pos, end = start;
+        while (end < p->len && is_digit(p->s[end])) end++;
+        if (end < p->len && p->s[end] == '.') {
+            // A float needs digits on both sides of the dot. "5." is an error at
+            // the dot. (".5" never gets here, the dot itself is the bad token.)
+            if (end + 1 >= p->len || !is_digit(p->s[end + 1])) {
+                fail(p, end);
+                return mk_int(0);
+            }
+            size_t fend = end + 1;
+            while (fend < p->len && is_digit(p->s[fend])) fend++;
+            // strtod would happily swallow an exponent like e3, which is not
+            // allowed here. So the text is cut at fend for a moment by putting
+            // a NUL there, instead of copying the digits somewhere else.
+            char saved = p->s[fend];
+            p->s[fend] = '\0';
+            double d = strtod(p->s + start, NULL);
+            p->s[fend] = saved;
+            if (!isfinite(d)) {  // so many digits that it does not fit a double
+                fail(p, start);
+                return mk_int(0);
+            }
+            p->pos = fend;
+            return mk_float(d);
         }
+        // Digits that are not followed by a dot, plain integer. Anything that
+        // follows (like the e in 1.5e3 or a letter) is left for the caller,
+        // which reports it at its own position.
+        unsigned long long n = 0;
+        for (size_t k = start; k < end; k++) n = n * 10 + (unsigned long long)(p->s[k] - '0');
+        p->pos = end;
         return mk_int((long long)n);
     }
     if (c == '(') {
