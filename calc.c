@@ -1,0 +1,435 @@
+// Aadityapratap Singh Baghel 241ADB122
+// https://github.com/aadityapratap-dev/calc-lab-home
+// Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
+// Resources used: Claude (Anthropic), conversation history: LINK_TO_ADD
+
+// calc reads arithmetic expressions from text files and writes one result per
+// line (or the position of the first error) into an output file.
+
+// A strict c17 build hides some POSIX declarations (dirent, stat), this brings them back.
+#define _POSIX_C_SOURCE 200809L
+
+#include <dirent.h>
+#include <errno.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+// These end up in the output file names.
+#define STUDENT_NAME "aadityapratap"
+#define STUDENT_LASTNAME "baghel"
+#define STUDENT_ID "241ADB122"
+#define FILE_SUFFIX "_" STUDENT_NAME "_" STUDENT_LASTNAME "_" STUDENT_ID ".txt"
+
+// Smallest long long, written out so no extra header is needed.
+#define LL_MIN (-9223372036854775807LL - 1)
+
+// ===== small helpers =====
+
+static void *xrealloc(void *ptr, size_t n) {
+    void *q = realloc(ptr, n);
+    if (q == NULL) {
+        fprintf(stderr, "calc: out of memory\n");
+        exit(1);
+    }
+    return q;
+}
+
+static int is_digit(char c) { return c >= '0' && c <= '9'; }
+
+// Results are collected here and written once at the end. If an error shows up
+// on line 500 the file must contain only the error, so nothing can be written
+// early. The buffer doubles when it is full, so adding is cheap and nothing is
+// copied again and again, even for output of many megabytes.
+typedef struct {
+    char *d;
+    size_t len;
+    size_t cap;
+} Buf;
+
+static void buf_add(Buf *b, const char *s, size_t n) {
+    if (b->len + n > b->cap) {
+        size_t cap = b->cap ? b->cap : 4096;
+        while (cap < b->len + n) cap *= 2;
+        b->d = xrealloc(b->d, cap);
+        b->cap = cap;
+    }
+    memcpy(b->d + b->len, s, n);
+    b->len += n;
+}
+
+// AI (Claude): prompt "read a whole file into memory in C without knowing its size"
+// Used the idea of growing the buffer by doubling with realloc. Doubling means
+// a huge file is copied only a handful of times in total, not once per chunk.
+// One spare byte at the end holds a NUL so strtod can stop safely later.
+static char *read_file(const char *path, size_t *len_out) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return NULL;
+    size_t cap = 1 << 16, len = 0;
+    char *buf = xrealloc(NULL, cap + 1);
+    for (;;) {
+        len += fread(buf + len, 1, cap - len, f);
+        if (len < cap) break;  // a short read means end of file or an error
+        cap *= 2;
+        buf = xrealloc(buf, cap + 1);
+    }
+    if (ferror(f)) {
+        int saved = errno;  // fclose and free could overwrite it
+        fclose(f);
+        free(buf);
+        errno = saved;
+        return NULL;
+    }
+    fclose(f);
+    buf[len] = '\0';
+    *len_out = len;
+    return buf;
+}
+
+// ===== values =====
+
+typedef long long Value;
+
+static Value mk_int(long long n) { return n; }
+
+// ===== parser state =====
+
+// One operand of a chain like 2 ** 3 ** 2, see parse_power.
+typedef struct {
+    Value v;
+    size_t start;  // where this operand begins in the file
+    size_t op;     // where the ** in front of it begins
+} PowItem;
+
+// The parser never cuts tokens out of the text. It walks pos over the one big
+// buffer, so pos is always "how many characters of the whole file we have
+// passed", and every newline and every character of a comment line is counted
+// without any extra work. An error position is simply pos + 1 (the task counts
+// from 1) at the moment we find out a token is wrong.
+typedef struct {
+    char *s;      // the whole file
+    size_t len;
+    size_t pos;
+    size_t err;   // 0 means no error yet, otherwise the 1 based position to report
+    PowItem *chain;
+    size_t chain_cap;
+    size_t chain_top;
+} Parser;
+
+// Only the first error counts, everything after it is just unwinding.
+static void fail(Parser *p, size_t idx) {
+    if (p->err == 0) p->err = idx + 1;
+}
+
+static int at_eol(const Parser *p) { return p->pos >= p->len || p->s[p->pos] == '\n'; }
+
+// Spaces and tabs are allowed between any two tokens, nothing else is.
+static void skip_ws(Parser *p) {
+    while (p->pos < p->len && (p->s[p->pos] == ' ' || p->s[p->pos] == '\t')) p->pos++;
+}
+
+// True when the next token is the ** operator. Both stars have to touch, so
+// "* *" is two operators in a row (an error), not a power.
+static int at_pow(Parser *p) {
+    skip_ws(p);
+    return p->pos + 1 < p->len && p->s[p->pos] == '*' && p->s[p->pos + 1] == '*';
+}
+
+// ===== arithmetic =====
+
+// AI (Claude): prompt "fast integer power in C that cannot hit undefined behaviour on overflow"
+// Squaring the base only while bits of the exponent are left keeps 1 ** 1000000000
+// down to about 30 steps. Unsigned maths wraps instead of being undefined.
+static unsigned long long ipow(unsigned long long base, unsigned long long e) {
+    unsigned long long result = 1;
+    while (e) {
+        if (e & 1) result *= base;
+        e >>= 1;
+        if (e) base *= base;
+    }
+    return result;
+}
+
+// op is + - * / or p for **. op_idx is where the operator starts and rhs_idx is
+// where the right operand starts, because the task wants different errors at
+// different places: division by zero and a negative exponent point at the right
+// operand, since that operand is what is wrong.
+static Value apply(Parser *p, char op, Value a, Value b, size_t op_idx, size_t rhs_idx) {
+    (void)op_idx;
+    unsigned long long x = (unsigned long long)a, y = (unsigned long long)b;
+    switch (op) {
+    case '+': return (Value)(x + y);
+    case '-': return (Value)(x - y);
+    case '*': return (Value)(x * y);
+    case '/':
+        if (b == 0) {
+            fail(p, rhs_idx);
+            return 0;
+        }
+        if (a == LL_MIN && b == -1) return a;  // the one division that overflows in C
+        return a / b;                          // C truncates toward zero, same as the task
+    default:
+        if (b < 0) {
+            fail(p, rhs_idx);
+            return 0;
+        }
+        return (Value)ipow(x, y);
+    }
+}
+
+static int format_value(char *out, size_t cap, Value v) {
+    return snprintf(out, cap, "%lld\n", v);
+}
+
+// ===== parser =====
+// One function per precedence level, the tightest binding one at the bottom.
+// Each level asks the next tighter level for its operands, so 3 + 2 * 5 groups
+// as 3 + (2 * 5): the + level never sees the 2 on its own, the * level takes it.
+//   expr    is term, then any number of plus or minus followed by a term
+//   term    is power, then any number of times or divide followed by a power
+//   power   is primary, optionally ** and more of the same
+//   primary is a number or a bracketed expr
+
+static Value parse_expr(Parser *p);
+
+// A number or a bracketed expression. This is also where most syntax errors are
+// noticed: any token that is neither a number nor an opening bracket is reported
+// at its own start. That covers an invalid character, a second operator in a row
+// ("7 + * 3") and a stray closing bracket ("2 * ()"). When the line ended
+// instead, the error points at the newline (or one past the end of the file when
+// the last line has no newline), which is what a missing operand or a missing
+// closing bracket should report.
+static Value parse_primary(Parser *p) {
+    skip_ws(p);
+    if (at_eol(p)) {
+        fail(p, p->pos);
+        return mk_int(0);
+    }
+    char c = p->s[p->pos];
+    if (is_digit(c)) {
+        unsigned long long n = 0;
+        while (p->pos < p->len && is_digit(p->s[p->pos])) {
+            n = n * 10 + (unsigned long long)(p->s[p->pos] - '0');
+            p->pos++;
+        }
+        return mk_int((long long)n);
+    }
+    if (c == '(') {
+        p->pos++;
+        Value v = parse_expr(p);
+        if (p->err) return v;
+        skip_ws(p);
+        // Anything except a closing bracket is wrong, at the end of the line
+        // that is the missing bracket, otherwise it is the unexpected token.
+        if (at_eol(p) || p->s[p->pos] != ')') {
+            fail(p, p->pos);
+            return v;
+        }
+        p->pos++;
+        return v;
+    }
+    fail(p, p->pos);
+    return mk_int(0);
+}
+
+static void chain_push(Parser *p, Value v, size_t start, size_t op) {
+    if (p->chain_top == p->chain_cap) {
+        p->chain_cap = p->chain_cap ? p->chain_cap * 2 : 16;
+        p->chain = xrealloc(p->chain, p->chain_cap * sizeof(PowItem));
+    }
+    PowItem it = {v, start, op};
+    p->chain[p->chain_top++] = it;
+}
+
+// ** is right associative: 2 ** 3 ** 2 has to be 2 ** (3 ** 2) = 512, the
+// exponent is itself a whole chain. The chain is read first and then folded from
+// the right, so the last pair is calculated first. A loop instead of a function
+// that calls itself gives the same grouping, but a line with a million ** in a
+// row cannot overflow the stack. The chain lives on one shared stack
+// (chain_top) because brackets can start a new chain in the middle of this one.
+static Value parse_power(Parser *p) {
+    Value first = parse_primary(p);
+    if (p->err || !at_pow(p)) return first;
+    size_t base = p->chain_top;
+    chain_push(p, first, 0, 0);
+    while (at_pow(p)) {
+        size_t op = p->pos;
+        p->pos += 2;
+        skip_ws(p);
+        size_t start = p->pos;
+        Value v = parse_primary(p);
+        if (p->err) return v;
+        chain_push(p, v, start, op);
+    }
+    size_t top = p->chain_top;
+    Value acc = p->chain[top - 1].v;
+    for (size_t k = top - 1; k > base; k--) {
+        // chain[k].start is where the exponent begins, which is where a
+        // negative exponent is reported.
+        acc = apply(p, 'p', p->chain[k - 1].v, acc, p->chain[k].op, p->chain[k].start);
+        if (p->err) break;
+    }
+    p->chain_top = base;
+    return acc;
+}
+
+// * and / are left associative: 8 / 4 / 2 is (8 / 4) / 2. The loop does that,
+// each new operand is combined with everything to its left.
+static Value parse_term(Parser *p) {
+    Value l = parse_power(p);
+    while (!p->err) {
+        skip_ws(p);
+        if (p->pos >= p->len) break;
+        char c = p->s[p->pos];
+        if (c != '*' && c != '/') break;
+        size_t op = p->pos;
+        p->pos++;
+        skip_ws(p);
+        size_t rhs = p->pos;
+        Value r = parse_power(p);
+        if (p->err) break;
+        l = apply(p, c, l, r, op, rhs);
+    }
+    return l;
+}
+
+// Same loop for + and -, one level looser than term.
+static Value parse_expr(Parser *p) {
+    Value l = parse_term(p);
+    while (!p->err) {
+        skip_ws(p);
+        if (p->pos >= p->len) break;
+        char c = p->s[p->pos];
+        if (c != '+' && c != '-') break;
+        size_t op = p->pos;
+        p->pos++;
+        skip_ws(p);
+        size_t rhs = p->pos;
+        Value r = parse_term(p);
+        if (p->err) break;
+        l = apply(p, c, l, r, op, rhs);
+    }
+    return l;
+}
+
+// Evaluates the whole file. The file is one flat buffer that is read once from
+// start to end and never copied, so size and line length do not matter.
+static void run_file(char *text, size_t len, Buf *out) {
+    Parser p = {text, len, 0, 0, NULL, 0, 0};
+    while (p.pos < p.len) {
+        skip_ws(&p);
+        if (at_eol(&p)) {  // blank line, nothing to output
+            if (p.pos < p.len) p.pos++;
+            continue;
+        }
+        if (p.s[p.pos] == '#') {  // comment line, only counts for positions
+            while (p.pos < p.len && p.s[p.pos] != '\n') p.pos++;
+            if (p.pos < p.len) p.pos++;
+            continue;
+        }
+        Value v = parse_expr(&p);
+        if (!p.err) {
+            // The expression must use up the whole line. What is left over is an
+            // extra closing bracket, a stray character or a # that is not at the
+            // start of the line, all reported where they start.
+            skip_ws(&p);
+            if (!at_eol(&p)) fail(&p, p.pos);
+        }
+        if (p.err) break;
+        char tmp[64];
+        int n = format_value(tmp, sizeof tmp, v);
+        buf_add(out, tmp, (size_t)n);
+        if (p.pos < p.len) p.pos++;  // step over the newline
+    }
+    if (p.err) {
+        // No partial results: throw away what was collected so far.
+        out->len = 0;
+        char tmp[64];
+        int n = snprintf(tmp, sizeof tmp, "ERROR:%llu\n", (unsigned long long)p.err);
+        buf_add(out, tmp, (size_t)n);
+    }
+    free(p.chain);
+}
+
+// ===== files and command line =====
+
+// Last part of a path. strip_txt removes a trailing .txt. Trailing slashes are
+// ignored so "labs/" gives "labs".
+static char *make_base(const char *path, int strip_txt) {
+    size_t end = strlen(path);
+    while (end > 1 && path[end - 1] == '/') end--;
+    size_t start = end;
+    while (start > 0 && path[start - 1] != '/') start--;
+    size_t n = end - start;
+    if (strip_txt && n > 4 && memcmp(path + end - 4, ".txt", 4) == 0) n -= 4;
+    char *out = xrealloc(NULL, n + 1);
+    memcpy(out, path + start, n);
+    out[n] = '\0';
+    return out;
+}
+
+// Makes the output folder if it is missing (its parent is expected to exist).
+static int ensure_dir(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) return 0;
+        fprintf(stderr, "calc: '%s' exists and is not a folder\n", path);
+        return -1;
+    }
+    if (mkdir(path, 0777) != 0) {
+        fprintf(stderr, "calc: cannot create folder '%s': %s\n", path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int write_file(const char *path, const Buf *b) {
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "calc: cannot write '%s': %s\n", path, strerror(errno));
+        return -1;
+    }
+    int ok = b->len == 0 || fwrite(b->d, 1, b->len, f) == b->len;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "calc: error while writing '%s'\n", path);
+        return -1;
+    }
+    return 0;
+}
+
+// Evaluates one input file and writes <out_dir>/<base>_<name>_<lastname>_<id>.txt
+static int process_file(const char *in_path, const char *out_dir) {
+    size_t len = 0;
+    char *text = read_file(in_path, &len);
+    if (text == NULL) {
+        fprintf(stderr, "calc: cannot read '%s': %s\n", in_path, strerror(errno));
+        return -1;
+    }
+    Buf out = {NULL, 0, 0};
+    run_file(text, len, &out);
+    free(text);
+
+    int rc = ensure_dir(out_dir);
+    if (rc == 0) {
+        char *base = make_base(in_path, 1);
+        int n = snprintf(NULL, 0, "%s/%s" FILE_SUFFIX, out_dir, base);
+        char *path = xrealloc(NULL, (size_t)n + 1);
+        snprintf(path, (size_t)n + 1, "%s/%s" FILE_SUFFIX, out_dir, base);
+        rc = write_file(path, &out);
+        free(path);
+        free(base);
+    }
+    free(out.d);
+    return rc;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4 || strcmp(argv[1], "-o") != 0) {
+        fprintf(stderr, "usage: calc -o OUTDIR input.txt\n");
+        return 2;
+    }
+    return process_file(argv[3], argv[2]) == 0 ? 0 : 1;
+}
