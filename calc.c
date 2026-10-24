@@ -14,14 +14,12 @@
 #include <string.h>
 #include <sys/stat.h>
 
-// these go into the output file names
 #define STUDENT_NAME "aadityapratap"
 #define STUDENT_LASTNAME "baghel"
 #define STUDENT_ID "241ADB122"
 
 enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_POW, T_LP, T_RP, T_EOL, T_BAD };
 
-// a number is either an int or a double, is_float says which field to use
 struct num {
     int is_float;
     long long i;
@@ -37,7 +35,7 @@ struct token {
 static const char *src;     // the whole file, with one extra \n after the end
 static size_t src_len;
 static size_t scan;         // where the tokenizer is, never reset between lines
-static struct token cur;    // the token the parser is looking at
+static struct token cur;
 static size_t err_pos;      // 1 based, 0 means no error yet
 
 static char *out;
@@ -46,11 +44,8 @@ static size_t out_len, out_cap;
 static char *numbuf;        // scratch copy of a float token for strtod
 static size_t numcap;
 
-// reads the whole file into one malloc'd buffer, returns NULL if it can't be opened.
-// files can be several MB so this matters: the file is read once, front to back,
-// and everything after this works on that one buffer by index. nothing gets cut
-// out, copied or joined again per line, so the work grows with the file size and
-// not with its size squared
+// whole file into one buffer, NULL if it won't open. read once and everything
+// after works on it by index, nothing gets copied per line
 static char *read_file(const char *path, size_t *len)
 {
     FILE *fp = fopen(path, "rb");
@@ -63,8 +58,6 @@ static char *read_file(const char *path, size_t *len)
     if (buf == NULL)
         exit(1);
 
-    // double the buffer when it's full instead of adding a fixed amount. that way
-    // the copying done by realloc adds up to about one extra copy of the file
     while (1) {
         size_t got = fread(buf + n, 1, cap - n, fp);
         n += got;
@@ -80,9 +73,8 @@ static char *read_file(const char *path, size_t *len)
     return buf;
 }
 
-// output gets appended to one buffer that doubles when full, so adding a line
-// is cheap no matter how many lines came before. whole output is built up in memory first. if an error shows up later in the
-// file nothing is written except the ERROR line, so I can't stream it out
+// results stay in memory until the file is done, an error late in the file
+// throws all of them away
 static void out_add(const char *s, size_t n)
 {
     if (out_cap == 0)
@@ -96,16 +88,13 @@ static void out_add(const char *s, size_t n)
     out_len += n;
 }
 
-// only the first error counts, anything after it is a side effect of the first
 static void fail(size_t at)
 {
     if (err_pos == 0)
         err_pos = at + 1;
 }
 
-// strtod needs a \0 at the end of the number and the file text has none there,
-// so copy the token into a scratch buffer. it is reused, so no malloc per number.
-// I can't just call strtod on src directly, it would swallow the e in 1.5e3
+// strtod straight on src would eat the e in 1.5e3, so copy the token first
 static struct num to_float(size_t from, size_t to)
 {
     size_t n = to - from;
@@ -148,11 +137,9 @@ static struct num make_int(long long i)
     return r;
 }
 
-// Tokenizer structure based on K&R chapter 4.3, walking along the text with an
-//   index and looking at one char at a time. the position bookkeeping is my own.
-// scan counts every char of the file from 0, including the \n at the end of
-// each line, and it is never reset when a new line starts. so start + 1 is
-// already the position the task wants (1 based, \n counted)
+// Tokenizer structure based on K&R chapter 4.3, one char at a time.
+//   the positions part is my own: scan is never reset between lines and the \n
+//   counts, so start + 1 is the position
 static void next_token(void)
 {
     while (src[scan] == ' ' || src[scan] == '\t')
@@ -161,7 +148,7 @@ static void next_token(void)
 
     char c = src[scan];
     if (c == '\n') {
-        // the \n is not eaten, it stays as the end of line token
+        // \n is left alone, nothing moves past it
         cur.kind = T_EOL;
         return;
     }
@@ -169,10 +156,8 @@ static void next_token(void)
         cur.kind = T_NUM;
         while (src[scan] >= '0' && src[scan] <= '9')
             scan++;
-        // it is only a float when there are digits on both sides of the dot.
-        // so 5. and .5 never become floats here, the 5 (or nothing) is a number
-        // and the leftover . is a bad char token on the next call, which puts
-        // the error at the dot. same for the e in 1.5e3
+        // 5. and 1.5e3 stop early, the leftover . or e comes out as T_BAD
+        // next call and the error lands on it
         if (src[scan] == '.' && src[scan + 1] >= '0' && src[scan + 1] <= '9') {
             scan++;
             while (src[scan] >= '0' && src[scan] <= '9')
@@ -193,8 +178,7 @@ static void next_token(void)
     } else if (c == '-') {
         cur.kind = T_MINUS;
     } else if (c == '*') {
-        // ** is one token, so look one char ahead. "* *" with a space stays two
-        // separate stars and that is an error later, which is what we want
+        // "* *" with a space is two stars, only ** together is a power
         if (src[scan] == '*') {
             scan++;
             cur.kind = T_POW;
@@ -221,44 +205,31 @@ static struct num primary(void)
         v = cur.val;
         next_token();
     } else if (cur.kind == T_LP) {
-        // a ( starts a whole new expr, which is how the nesting works. expr
-        // calls down to primary, primary calls expr again for what is inside
         next_token();
         v = expr();
         if (!err_pos) {
             if (cur.kind == T_RP)
                 next_token();
             else
-                // expr gave up on something that isn't ), most of the time
-                // that is the \n of the line, so missing ) lands on the \n
+                // usually the \n
                 fail(cur.start);
         }
     } else {
-        // not a number where one has to be. this covers all three cases at once:
-        // a bad char (cur is the T_BAD token, so its own position), two operators
-        // in a row (cur is the second one) and a missing operand (cur is the \n,
-        // or file length + 1 for the last line). in every case cur.start is the
-        // token the parser got stuck on, which is exactly what the task wants
+        // bad char, second operator and missing operand all come here, cur is
+        // whatever broke it. errors always go at the token the parser got stuck on
         fail(cur.start);
     }
     return v;
 }
 
-// int or float? every operation looks at both operands. if either one is a
-// float the whole thing is done in double, otherwise it stays long long math.
-// that is why 7 / 2 is 3 but 7 / 2.0 is 3.5. a float never goes back to int
-//
-// for float results the check is the same everywhere: if the answer is inf or
-// nan the operator is blamed, because the operator is what blew it up (the
-// operands were fine, 10.0 and 400 are both ok on their own)
+// int or float: one float operand and the whole operation is double, 7 / 2 is
+// 3 but 7 / 2.0 is 3.5. it never goes back to int. if a float result comes out
+// inf or nan the operator gets blamed, same check in expr and term too
 
-// one a ** b step, base ** e. op_at and exp_at are where the operator and the
-// exponent start, for the error position
 static struct num do_power(struct num base, struct num e, size_t op_at, size_t exp_at)
 {
     if (base.is_float || e.is_float) {
-        // pow() gives nan for stuff like (0 - 8) ** 0.5 and inf when it gets
-        // too big, both land on the operator
+        // (0 - 8) ** 0.5 is nan
         double r = pow(as_double(base), as_double(e));
         if (!isfinite(r)) {
             fail(op_at);
@@ -268,15 +239,11 @@ static struct num do_power(struct num base, struct num e, size_t op_at, size_t e
     }
 
     if (e.i < 0) {
-        // two ints and a negative exponent. the exponent is what's wrong, so
-        // point at the start of it (saved before it was parsed, because by now
-        // cur has moved on to whatever comes after it)
+        // points at the exponent, exp_at was saved before it got parsed
         fail(exp_at);
         return base;
     }
 
-    // square and multiply. the b *= b is skipped on the last round so it
-    // can't overflow for no reason
     long long b = base.i;
     long long n = e.i;
     long long r = 1;
@@ -290,9 +257,7 @@ static struct num do_power(struct num base, struct num e, size_t op_at, size_t e
     return make_int(r);
 }
 
-// operands of the ** chain that power() is working on right now. it is a stack
-// on purpose, a ( inside the chain calls power() again and that one has to
-// leave the entries of the outer one alone
+// stack, because a ( in the middle of a chain starts another power()
 struct pow_item {
     struct num val;
     size_t op_at;   // the ** in front of this operand (not used for the first)
@@ -316,11 +281,10 @@ static void chain_push(struct num val, size_t op_at, size_t at)
 }
 
 // power := primary [ '**' power ]
-// that is the grammar, and it is right associative because the exponent is
-// itself a whole power. the straight way would be power() calling itself, but
-// then a line with 100000 ** in it recurses 100000 deep and crashes. so I
-// collect the operands first and combine them from the right end instead, which
-// gives the same grouping: 2 ** 3 ** 2 is 2 ** (3 ** 2) = 512, not 64
+// first version really did call power() for the exponent, like the grammar says.
+// then a test line with 200000 ** segfaulted (stack). so now the operands go
+// into chain and get combined from the right end, same grouping, 2 ** 3 ** 2
+// is 2 ** (3 ** 2) = 512
 static struct num power(void)
 {
     size_t first = chain_len;
@@ -336,7 +300,7 @@ static struct num power(void)
     }
 
     struct num acc = chain[chain_len - 1].val;
-    // chain[k] is an exponent, chain[k - 1] its base. already failed? then skip
+    // chain[k] is the exponent, chain[k - 1] its base
     for (size_t k = chain_len - 1; !err_pos && k > first; k--)
         acc = do_power(chain[k - 1].val, acc, chain[k].op_at, chain[k].at);
 
@@ -345,7 +309,6 @@ static struct num power(void)
 }
 
 // term := power { ('*' | '/') power }
-// same loop trick as expr below, so 8 / 4 / 2 is (8 / 4) / 2
 static struct num term(void)
 {
     struct num lhs = power();
@@ -360,9 +323,7 @@ static struct num term(void)
 
         int is_float = lhs.is_float || rhs.is_float;
         if (op == T_SLASH && (is_float ? as_double(rhs) == 0.0 : rhs.i == 0)) {
-            // the 0 is the problem, not the slash, so point at where the right
-            // operand starts. rhs_at is saved before parsing it because by the
-            // time we get here cur has moved on to the next token
+            // blame the right operand, rhs_at saved before power() moved cur on
             fail(rhs_at);
             break;
         }
@@ -376,19 +337,17 @@ static struct num term(void)
         } else if (op == T_STAR) {
             lhs = make_int(lhs.i * rhs.i);
         } else {
-            lhs = make_int(lhs.i / rhs.i);  // C already truncates toward zero, which is what we need
+            lhs = make_int(lhs.i / rhs.i);
         }
     }
     return lhs;
 }
 
 // expr := term { ('+' | '-') term }
-// Recursive descent with one function per level is from Aho et al. section 2.4,
-//   the left recursion there is turned into the while loops here, my own version.
-// expr calls term, term calls power, power calls primary. each level only sees
-// the results of the level under it, so ** is glued together first, then * and /,
-// and + and - get what is left. that is the whole reason for the precedence.
-// 3 + 2 * 5 is 3 + (2 * 5)
+// Recursive descent, one function per level, from Aho et al. section 2.4.
+//   the while loops instead of left recursion are my own.
+// expr calls term, term calls power, so + and - get whatever * / ** left over,
+// that's why 3 + 2 * 5 is 3 + (2 * 5)
 static struct num expr(void)
 {
     struct num lhs = term();
@@ -415,8 +374,6 @@ static struct num expr(void)
     return lhs;
 }
 
-// goes through the file line by line using indexes only (no strtok, no copying
-// a line out first), so a 5 MB file is one pass
 static void run(void)
 {
     size_t line = 0;    // index where the current line starts
@@ -425,24 +382,19 @@ static void run(void)
         scan = line;
         while (src[scan] == ' ' || src[scan] == '\t')
             scan++;
-        // a # as the first thing on the line makes it a comment. skipping to the
-        // \n by moving scan means the comment chars still get counted for positions
+        // comment, scan moves over it so the chars still count
         if (src[scan] == '#') {
             while (src[scan] != '\n')
                 scan++;
         }
         if (src[scan] == '\n') {
-            // blank line or comment, no output for it
             line = scan + 1;
             continue;
         }
 
         next_token();
         struct num v = expr();
-        // expr stopped on something that isn't an operator, so this is leftover
-        // junk like a bad char after a complete number. blame that token.
-        // an extra ) also ends up here, nothing was open for it so primary never
-        // ate it, and it gets reported at its own position
+        // something left over, an extra ) ends up here too
         if (!err_pos && cur.kind != T_EOL)
             fail(cur.start);
         if (err_pos)
@@ -459,7 +411,6 @@ static void run(void)
     }
 }
 
-// pointer to the file name part of a path, len is its length without a .txt
 static const char *file_stem(const char *path, size_t *len)
 {
     const char *base = strrchr(path, '/');
@@ -470,7 +421,7 @@ static const char *file_stem(const char *path, size_t *len)
     return base;
 }
 
-// same idea for a folder, "labs" and "labs/" both have to give labs
+// labs and labs/ both give labs
 static const char *dir_stem(const char *path, size_t *len)
 {
     size_t end = strlen(path);
@@ -492,8 +443,6 @@ static int make_dir(const char *path)
     return 0;
 }
 
-// evaluates one file and writes <outdir>/<stem>_<name>_<lastname>_<id>.txt
-// the out buffer and the error state are shared, so they get reset first
 static int do_file(const char *input, const char *outdir)
 {
     size_t len;
@@ -502,9 +451,8 @@ static int do_file(const char *input, const char *outdir)
         fprintf(stderr, "can't open %s: %s\n", input, strerror(errno));
         return 1;
     }
-    // read_file only stops when n < cap, so this spare byte is always there.
-    // having a \n at the very end means a last line without one still ends
-    // properly, and its end of line position comes out as file length + 1
+    // there is always a spare byte here. the extra \n means a last line without
+    // one still ends, and its position comes out as file length + 1
     text[len] = '\n';
     src = text;
     src_len = len;
@@ -514,7 +462,6 @@ static int do_file(const char *input, const char *outdir)
 
     run();
     if (err_pos) {
-        // an error anywhere means no partial results, throw away what we had
         char tmp[32];
         int n = snprintf(tmp, sizeof tmp, "ERROR:%zu\n", err_pos);
         out_len = 0;
@@ -562,7 +509,7 @@ static int do_dir(const char *dir, const char *outdir)
 
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
-        // only plain files directly inside, a folder called x.txt doesn't count
+        // a folder called x.txt doesn't count
         struct stat st;
         if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
             continue;
@@ -604,7 +551,6 @@ int main(int argc, char **argv)
             input = a;
         }
     }
-    // exactly one of -d and a file name
     if ((dir == NULL) == (input == NULL))
         return usage();
 
