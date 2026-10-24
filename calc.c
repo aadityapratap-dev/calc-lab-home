@@ -1,7 +1,7 @@
 // Aadityapratap Singh Baghel 241ADB122
 // https://github.com/aadityapratap-dev/calc-lab-home
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
-// Resources used: K&R "The C Programming Language" 2nd ed. chapter 5 (pointers and walking through chars), Aho/Lam/Sethi/Ullman "Compilers: Principles, Techniques, and Tools" 2nd ed. section 2.4 (recursive descent). Details in the comments where I used them.
+// Resources used: K&R "The C Programming Language" 2nd ed. chapter 4.3 (the calculator example, reading chars one at a time), Aho/Lam/Sethi/Ullman "Compilers: Principles, Techniques, and Tools" 2nd ed. section 2.4 (recursive descent). Details in the comments where I used them.
 
 // strict c17 hides some posix stuff (mkdir, dirent, stat), this brings it back
 #define _POSIX_C_SOURCE 200809L
@@ -148,7 +148,7 @@ static struct num make_int(long long i)
     return r;
 }
 
-// Tokenizer structure based on K&R chapter 5, walking along the text with an
+// Tokenizer structure based on K&R chapter 4.3, walking along the text with an
 //   index and looking at one char at a time. the position bookkeeping is my own.
 // scan counts every char of the file from 0, including the \n at the end of
 // each line, and it is never reset when a new line starts. so start + 1 is
