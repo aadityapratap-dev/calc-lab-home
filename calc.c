@@ -14,8 +14,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define STUDENT_NAME "aadityapratap"
-#define STUDENT_LASTNAME "baghel"
+#define STUDENT_NAME "Aadityapratap Singh"
+#define STUDENT_LASTNAME "Baghel"
 #define STUDENT_ID "241ADB122"
 
 enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_POW, T_LP, T_RP, T_EOL, T_BAD };
