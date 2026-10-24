@@ -14,7 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define STUDENT_NAME "Aadityapratap Singh"
+#define STUDENT_NAME "Aadityapratap-Singh"
 #define STUDENT_LASTNAME "Baghel"
 #define STUDENT_ID "241ADB122"
 
