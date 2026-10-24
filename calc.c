@@ -78,6 +78,7 @@ static void out_add(const char *s, size_t n)
     out_len += n;
 }
 
+// only the first error counts, anything after it is a side effect of the first
 static void fail(size_t at)
 {
     if (err_pos == 0)
@@ -123,6 +124,11 @@ static long long primary(void)
         v = cur.val;
         next_token();
     } else {
+        // not a number where one has to be. this covers all three cases at once:
+        // a bad char (cur is the T_BAD token, so its own position), two operators
+        // in a row (cur is the second one) and a missing operand (cur is the \n,
+        // or file length + 1 for the last line). in every case cur.start is the
+        // token the parser got stuck on, which is exactly what the task wants
         fail(cur.start);
     }
     return v;
@@ -161,6 +167,8 @@ static void run(void)
 
         next_token();
         long long v = expr();
+        // expr stopped on something that isn't an operator, so this is leftover
+        // junk like a bad char after a complete number. blame that token
         if (!err_pos && cur.kind != T_EOL)
             fail(cur.start);
         if (err_pos)
@@ -202,8 +210,11 @@ int main(int argc, char **argv)
 
     run();
     if (err_pos) {
-        fprintf(stderr, "bad expression at %zu\n", err_pos);
-        return 1;
+        // an error anywhere means no partial results, throw away what we had
+        char tmp[32];
+        int n = snprintf(tmp, sizeof tmp, "ERROR:%zu\n", err_pos);
+        out_len = 0;
+        out_add(tmp, n);
     }
 
     // task1.txt becomes task1_<name>_<lastname>_<id>.txt
