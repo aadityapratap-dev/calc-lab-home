@@ -17,7 +17,7 @@
 #define STUDENT_LASTNAME "baghel"
 #define STUDENT_ID "241ADB122"
 
-enum { T_NUM, T_PLUS, T_MINUS, T_EOL, T_BAD };
+enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_EOL, T_BAD };
 
 struct token {
     int kind;
@@ -112,6 +112,10 @@ static void next_token(void)
         cur.kind = T_PLUS;
     } else if (c == '-') {
         cur.kind = T_MINUS;
+    } else if (c == '*') {
+        cur.kind = T_STAR;
+    } else if (c == '/') {
+        cur.kind = T_SLASH;
     } else {
         cur.kind = T_BAD;
     }
@@ -134,15 +138,43 @@ static long long primary(void)
     return v;
 }
 
-// expr := primary { ('+' | '-') primary }
-// the loop makes it left associative, 10 - 3 + 1 is (10 - 3) + 1
-static long long expr(void)
+// term := primary { ('*' | '/') primary }
+// same loop trick as expr below, so 8 / 4 / 2 is (8 / 4) / 2
+static long long term(void)
 {
     long long lhs = primary();
+    while (!err_pos && (cur.kind == T_STAR || cur.kind == T_SLASH)) {
+        int op = cur.kind;
+        next_token();
+        size_t rhs_at = cur.start;
+        long long rhs = primary();
+        if (err_pos)
+            break;
+        if (op == T_STAR) {
+            lhs *= rhs;
+        } else if (rhs == 0) {
+            // the 0 is the problem, not the slash, so point at where the right
+            // operand starts. rhs_at has to be saved before primary() because
+            // by then cur has moved on to the next token
+            fail(rhs_at);
+        } else {
+            lhs /= rhs;     // C already truncates toward zero, which is what we need
+        }
+    }
+    return lhs;
+}
+
+// expr := term { ('+' | '-') term }
+// expr calls term, and term calls primary. so a * or / is always glued together
+// before expr gets to see it, and that is the whole reason they bind tighter
+// than + and -. 3 + 2 * 5 is 3 + (2 * 5)
+static long long expr(void)
+{
+    long long lhs = term();
     while (!err_pos && (cur.kind == T_PLUS || cur.kind == T_MINUS)) {
         int op = cur.kind;
         next_token();
-        long long rhs = primary();
+        long long rhs = term();
         if (op == T_PLUS)
             lhs += rhs;
         else
