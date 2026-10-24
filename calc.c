@@ -17,7 +17,7 @@
 #define STUDENT_LASTNAME "baghel"
 #define STUDENT_ID "241ADB122"
 
-enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_LP, T_RP, T_EOL, T_BAD };
+enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_POW, T_LP, T_RP, T_EOL, T_BAD };
 
 struct token {
     int kind;
@@ -113,7 +113,14 @@ static void next_token(void)
     } else if (c == '-') {
         cur.kind = T_MINUS;
     } else if (c == '*') {
-        cur.kind = T_STAR;
+        // ** is one token, so look one char ahead. "* *" with a space stays two
+        // separate stars and that is an error later, which is what we want
+        if (src[scan] == '*') {
+            scan++;
+            cur.kind = T_POW;
+        } else {
+            cur.kind = T_STAR;
+        }
     } else if (c == '/') {
         cur.kind = T_SLASH;
     } else if (c == '(') {
@@ -157,16 +164,51 @@ static long long primary(void)
     return v;
 }
 
-// term := primary { ('*' | '/') primary }
+// power := primary [ '**' power ]
+// no loop here on purpose. after the ** this calls power() again for the
+// exponent, so 2 ** 3 ** 2 groups as 2 ** (3 ** 2) = 512. a loop like in expr
+// would group it to the left, (2 ** 3) ** 2 = 64, which is wrong
+static long long power(void)
+{
+    long long base = primary();
+    if (err_pos || cur.kind != T_POW)
+        return base;
+
+    next_token();
+    size_t exp_at = cur.start;
+    long long e = power();
+    if (err_pos)
+        return base;
+    if (e < 0) {
+        // the exponent is what's wrong, so point at the start of it (saved
+        // before the call, same reason as the division by zero below)
+        fail(exp_at);
+        return 0;
+    }
+
+    // square and multiply. the b *= b is skipped on the last round so it
+    // can't overflow for no reason
+    long long r = 1;
+    while (e > 0) {
+        if (e & 1)
+            r *= base;
+        e >>= 1;
+        if (e > 0)
+            base *= base;
+    }
+    return r;
+}
+
+// term := power { ('*' | '/') power }
 // same loop trick as expr below, so 8 / 4 / 2 is (8 / 4) / 2
 static long long term(void)
 {
-    long long lhs = primary();
+    long long lhs = power();
     while (!err_pos && (cur.kind == T_STAR || cur.kind == T_SLASH)) {
         int op = cur.kind;
         next_token();
         size_t rhs_at = cur.start;
-        long long rhs = primary();
+        long long rhs = power();
         if (err_pos)
             break;
         if (op == T_STAR) {
@@ -184,9 +226,10 @@ static long long term(void)
 }
 
 // expr := term { ('+' | '-') term }
-// expr calls term, and term calls primary. so a * or / is always glued together
-// before expr gets to see it, and that is the whole reason they bind tighter
-// than + and -. 3 + 2 * 5 is 3 + (2 * 5)
+// expr calls term, term calls power, power calls primary. each level only sees
+// the results of the level under it, so ** is glued together first, then * and /,
+// and + and - get what is left. that is the whole reason for the precedence.
+// 3 + 2 * 5 is 3 + (2 * 5)
 static long long expr(void)
 {
     long long lhs = term();
@@ -210,8 +253,14 @@ static void run(void)
         scan = line;
         while (src[scan] == ' ' || src[scan] == '\t')
             scan++;
+        // a # as the first thing on the line makes it a comment. skipping to the
+        // \n by moving scan means the comment chars still get counted for positions
+        if (src[scan] == '#') {
+            while (src[scan] != '\n')
+                scan++;
+        }
         if (src[scan] == '\n') {
-            // blank line, no output for it
+            // blank line or comment, no output for it
             line = scan + 1;
             continue;
         }
