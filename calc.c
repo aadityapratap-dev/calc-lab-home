@@ -17,7 +17,7 @@
 #define STUDENT_LASTNAME "baghel"
 #define STUDENT_ID "241ADB122"
 
-enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_EOL, T_BAD };
+enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_LP, T_RP, T_EOL, T_BAD };
 
 struct token {
     int kind;
@@ -116,10 +116,16 @@ static void next_token(void)
         cur.kind = T_STAR;
     } else if (c == '/') {
         cur.kind = T_SLASH;
+    } else if (c == '(') {
+        cur.kind = T_LP;
+    } else if (c == ')') {
+        cur.kind = T_RP;
     } else {
         cur.kind = T_BAD;
     }
 }
+
+static long long expr(void);
 
 static long long primary(void)
 {
@@ -127,6 +133,19 @@ static long long primary(void)
     if (cur.kind == T_NUM) {
         v = cur.val;
         next_token();
+    } else if (cur.kind == T_LP) {
+        // a ( starts a whole new expr, which is how the nesting works. expr
+        // calls down to primary, primary calls expr again for what is inside
+        next_token();
+        v = expr();
+        if (!err_pos) {
+            if (cur.kind == T_RP)
+                next_token();
+            else
+                // expr gave up on something that isn't ), most of the time
+                // that is the \n of the line, so missing ) lands on the \n
+                fail(cur.start);
+        }
     } else {
         // not a number where one has to be. this covers all three cases at once:
         // a bad char (cur is the T_BAD token, so its own position), two operators
@@ -200,7 +219,9 @@ static void run(void)
         next_token();
         long long v = expr();
         // expr stopped on something that isn't an operator, so this is leftover
-        // junk like a bad char after a complete number. blame that token
+        // junk like a bad char after a complete number. blame that token.
+        // an extra ) also ends up here, nothing was open for it so primary never
+        // ate it, and it gets reported at its own position
         if (!err_pos && cur.kind != T_EOL)
             fail(cur.start);
         if (err_pos)
