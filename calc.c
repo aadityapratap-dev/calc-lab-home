@@ -3,9 +3,10 @@
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
 // Resources used: K&R "The C Programming Language" 2nd ed. chapter 5 (pointers and walking through chars), Aho/Lam/Sethi/Ullman "Compilers: Principles, Techniques, and Tools" 2nd ed. section 2.4 (recursive descent). Details in the comments where I used them.
 
-// strict c17 hides some posix stuff (mkdir for now), this brings it back
+// strict c17 hides some posix stuff (mkdir, dirent, stat), this brings it back
 #define _POSIX_C_SOURCE 200809L
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -283,32 +284,58 @@ static void run(void)
     }
 }
 
-int main(int argc, char **argv)
+// pointer to the file name part of a path, len is its length without a .txt
+static const char *file_stem(const char *path, size_t *len)
 {
-    const char *outdir = NULL;
-    const char *input = NULL;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    *len = strlen(base);
+    if (*len > 4 && strcmp(base + *len - 4, ".txt") == 0)
+        *len -= 4;
+    return base;
+}
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc)
-            outdir = argv[++i];
-        else
-            input = argv[i];
-    }
-    if (input == NULL || outdir == NULL) {
-        fprintf(stderr, "usage: calc -o OUTDIR input.txt\n");
+// same idea for a folder, "labs" and "labs/" both have to give labs
+static const char *dir_stem(const char *path, size_t *len)
+{
+    size_t end = strlen(path);
+    while (end > 1 && path[end - 1] == '/')
+        end--;
+    size_t start = end;
+    while (start > 0 && path[start - 1] != '/')
+        start--;
+    *len = end - start;
+    return path + start;
+}
+
+static int make_dir(const char *path)
+{
+    if (mkdir(path, 0777) != 0 && errno != EEXIST) {
+        fprintf(stderr, "can't create folder %s: %s\n", path, strerror(errno));
         return 1;
     }
+    return 0;
+}
 
-    char *text = read_file(input, &src_len);
+// evaluates one file and writes <outdir>/<stem>_<name>_<lastname>_<id>.txt
+// the out buffer and the error state are shared, so they get reset first
+static int do_file(const char *input, const char *outdir)
+{
+    size_t len;
+    char *text = read_file(input, &len);
     if (text == NULL) {
-        fprintf(stderr, "can't open %s\n", input);
+        fprintf(stderr, "can't open %s: %s\n", input, strerror(errno));
         return 1;
     }
     // read_file only stops when n < cap, so this spare byte is always there.
     // having a \n at the very end means a last line without one still ends
     // properly, and its end of line position comes out as file length + 1
-    text[src_len] = '\n';
+    text[len] = '\n';
     src = text;
+    src_len = len;
+    scan = 0;
+    err_pos = 0;
+    out_len = 0;
 
     run();
     if (err_pos) {
@@ -318,34 +345,117 @@ int main(int argc, char **argv)
         out_len = 0;
         out_add(tmp, n);
     }
+    free(text);
 
-    // task1.txt becomes task1_<name>_<lastname>_<id>.txt
-    const char *base = strrchr(input, '/');
-    base = base ? base + 1 : input;
-    size_t blen = strlen(base);
-    if (blen > 4 && strcmp(base + blen - 4, ".txt") == 0)
-        blen -= 4;
-
-    if (mkdir(outdir, 0777) != 0 && errno != EEXIST) {
-        fprintf(stderr, "can't create %s\n", outdir);
-        return 1;
-    }
+    size_t blen;
+    const char *base = file_stem(input, &blen);
     char path[4096];
     snprintf(path, sizeof path, "%s/%.*s_" STUDENT_NAME "_" STUDENT_LASTNAME "_" STUDENT_ID ".txt",
              outdir, (int)blen, base);
 
     FILE *fp = fopen(path, "wb");
     if (fp == NULL) {
-        fprintf(stderr, "can't write %s\n", path);
+        fprintf(stderr, "can't write %s: %s\n", path, strerror(errno));
         return 1;
     }
     fwrite(out, 1, out_len, fp);
     if (fclose(fp) != 0) {
-        fprintf(stderr, "write to %s failed\n", path);
+        fprintf(stderr, "writing %s failed\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+static int do_dir(const char *dir, const char *outdir)
+{
+    DIR *dp = opendir(dir);
+    if (dp == NULL) {
+        fprintf(stderr, "can't open folder %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    if (make_dir(outdir)) {
+        closedir(dp);
         return 1;
     }
 
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        size_t n = strlen(de->d_name);
+        if (n <= 4 || strcmp(de->d_name + n - 4, ".txt") != 0)
+            continue;
+
+        char path[4096];
+        snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        // only plain files directly inside, a folder called x.txt doesn't count
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        if (do_file(path, outdir))
+            rc = 1;
+    }
+    closedir(dp);
+    return rc;
+}
+
+static int usage(void)
+{
+    fprintf(stderr, "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
+    return 1;
+}
+
+int main(int argc, char **argv)
+{
+    const char *dir = NULL;
+    const char *outdir = NULL;
+    const char *input = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        char *a = argv[i];
+        if (strcmp(a, "-d") == 0 || strcmp(a, "--dir") == 0) {
+            if (++i >= argc)
+                return usage();
+            dir = argv[i];
+        } else if (strcmp(a, "-o") == 0 || strcmp(a, "--output-dir") == 0) {
+            if (++i >= argc)
+                return usage();
+            outdir = argv[i];
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "unknown option %s\n", a);
+            return usage();
+        } else if (input != NULL) {
+            return usage();
+        } else {
+            input = a;
+        }
+    }
+    // exactly one of -d and a file name
+    if ((dir == NULL) == (input == NULL))
+        return usage();
+
+    // no -o: <input_base>_<name>_<id> in the current folder
+    char defdir[4096];
+    if (outdir == NULL) {
+        size_t blen;
+        const char *base = dir ? dir_stem(dir, &blen) : file_stem(input, &blen);
+        snprintf(defdir, sizeof defdir, "%.*s_" STUDENT_NAME "_" STUDENT_ID, (int)blen, base);
+        outdir = defdir;
+    }
+
+    int rc;
+    if (dir != NULL) {
+        rc = do_dir(dir, outdir);
+    } else {
+        // a missing input should fail before we make an empty output folder
+        FILE *probe = fopen(input, "rb");
+        if (probe == NULL) {
+            fprintf(stderr, "can't open %s: %s\n", input, strerror(errno));
+            return 1;
+        }
+        fclose(probe);
+        rc = make_dir(outdir) || do_file(input, outdir);
+    }
+
     free(out);
-    free(text);
-    return 0;
+    return rc;
 }
