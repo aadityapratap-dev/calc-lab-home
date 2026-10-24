@@ -46,7 +46,11 @@ static size_t out_len, out_cap;
 static char *numbuf;        // scratch copy of a float token for strtod
 static size_t numcap;
 
-// reads the whole file into one malloc'd buffer, returns NULL if it can't be opened
+// reads the whole file into one malloc'd buffer, returns NULL if it can't be opened.
+// files can be several MB so this matters: the file is read once, front to back,
+// and everything after this works on that one buffer by index. nothing gets cut
+// out, copied or joined again per line, so the work grows with the file size and
+// not with its size squared
 static char *read_file(const char *path, size_t *len)
 {
     FILE *fp = fopen(path, "rb");
@@ -59,7 +63,8 @@ static char *read_file(const char *path, size_t *len)
     if (buf == NULL)
         exit(1);
 
-    // doubling idea from K&R, so the copying adds up to O(size) and not O(size^2)
+    // double the buffer when it's full instead of adding a fixed amount. that way
+    // the copying done by realloc adds up to about one extra copy of the file
     while (1) {
         size_t got = fread(buf + n, 1, cap - n, fp);
         n += got;
@@ -75,7 +80,8 @@ static char *read_file(const char *path, size_t *len)
     return buf;
 }
 
-// whole output is built up in memory first. if an error shows up later in the
+// output gets appended to one buffer that doubles when full, so adding a line
+// is cheap no matter how many lines came before. whole output is built up in memory first. if an error shows up later in the
 // file nothing is written except the ERROR line, so I can't stream it out
 static void out_add(const char *s, size_t n)
 {
@@ -142,6 +148,8 @@ static struct num make_int(long long i)
     return r;
 }
 
+// Tokenizer structure based on K&R chapter 5, walking along the text with an
+//   index and looking at one char at a time. the position bookkeeping is my own.
 // scan counts every char of the file from 0, including the \n at the end of
 // each line, and it is never reset when a new line starts. so start + 1 is
 // already the position the task wants (1 based, \n counted)
@@ -244,23 +252,10 @@ static struct num primary(void)
 // nan the operator is blamed, because the operator is what blew it up (the
 // operands were fine, 10.0 and 400 are both ok on their own)
 
-// power := primary [ '**' power ]
-// no loop here on purpose. after the ** this calls power() again for the
-// exponent, so 2 ** 3 ** 2 groups as 2 ** (3 ** 2) = 512. a loop like in expr
-// would group it to the left, (2 ** 3) ** 2 = 64, which is wrong
-static struct num power(void)
+// one a ** b step, base ** e. op_at and exp_at are where the operator and the
+// exponent start, for the error position
+static struct num do_power(struct num base, struct num e, size_t op_at, size_t exp_at)
 {
-    struct num base = primary();
-    if (err_pos || cur.kind != T_POW)
-        return base;
-
-    size_t op_at = cur.start;
-    next_token();
-    size_t exp_at = cur.start;
-    struct num e = power();
-    if (err_pos)
-        return base;
-
     if (base.is_float || e.is_float) {
         // pow() gives nan for stuff like (0 - 8) ** 0.5 and inf when it gets
         // too big, both land on the operator
@@ -274,8 +269,8 @@ static struct num power(void)
 
     if (e.i < 0) {
         // two ints and a negative exponent. the exponent is what's wrong, so
-        // point at the start of it (saved before the call, because by now cur
-        // has moved on to whatever comes after the exponent)
+        // point at the start of it (saved before it was parsed, because by now
+        // cur has moved on to whatever comes after it)
         fail(exp_at);
         return base;
     }
@@ -293,6 +288,60 @@ static struct num power(void)
             b *= b;
     }
     return make_int(r);
+}
+
+// operands of the ** chain that power() is working on right now. it is a stack
+// on purpose, a ( inside the chain calls power() again and that one has to
+// leave the entries of the outer one alone
+struct pow_item {
+    struct num val;
+    size_t op_at;   // the ** in front of this operand (not used for the first)
+    size_t at;      // where the operand starts
+};
+static struct pow_item *chain;
+static size_t chain_len, chain_cap;
+
+static void chain_push(struct num val, size_t op_at, size_t at)
+{
+    if (chain_len == chain_cap) {
+        chain_cap = chain_cap ? chain_cap * 2 : 64;
+        chain = realloc(chain, chain_cap * sizeof *chain);
+        if (chain == NULL)
+            exit(1);
+    }
+    chain[chain_len].val = val;
+    chain[chain_len].op_at = op_at;
+    chain[chain_len].at = at;
+    chain_len++;
+}
+
+// power := primary [ '**' power ]
+// that is the grammar, and it is right associative because the exponent is
+// itself a whole power. the straight way would be power() calling itself, but
+// then a line with 100000 ** in it recurses 100000 deep and crashes. so I
+// collect the operands first and combine them from the right end instead, which
+// gives the same grouping: 2 ** 3 ** 2 is 2 ** (3 ** 2) = 512, not 64
+static struct num power(void)
+{
+    size_t first = chain_len;
+    size_t at = cur.start;
+    chain_push(primary(), 0, at);
+
+    while (!err_pos && cur.kind == T_POW) {
+        size_t op_at = cur.start;
+        next_token();
+        at = cur.start;
+        struct num v = primary();
+        chain_push(v, op_at, at);
+    }
+
+    struct num acc = chain[chain_len - 1].val;
+    // chain[k] is an exponent, chain[k - 1] its base. already failed? then skip
+    for (size_t k = chain_len - 1; !err_pos && k > first; k--)
+        acc = do_power(chain[k - 1].val, acc, chain[k].op_at, chain[k].at);
+
+    chain_len = first;
+    return acc;
 }
 
 // term := power { ('*' | '/') power }
@@ -334,6 +383,8 @@ static struct num term(void)
 }
 
 // expr := term { ('+' | '-') term }
+// Recursive descent with one function per level is from Aho et al. section 2.4,
+//   the left recursion there is turned into the while loops here, my own version.
 // expr calls term, term calls power, power calls primary. each level only sees
 // the results of the level under it, so ** is glued together first, then * and /,
 // and + and - get what is left. that is the whole reason for the precedence.
@@ -364,6 +415,8 @@ static struct num expr(void)
     return lhs;
 }
 
+// goes through the file line by line using indexes only (no strtok, no copying
+// a line out first), so a 5 MB file is one pass
 static void run(void)
 {
     size_t line = 0;    // index where the current line starts
@@ -580,5 +633,6 @@ int main(int argc, char **argv)
 
     free(out);
     free(numbuf);
+    free(chain);
     return rc;
 }
