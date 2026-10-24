@@ -8,6 +8,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,10 +21,17 @@
 
 enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_POW, T_LP, T_RP, T_EOL, T_BAD };
 
+// a number is either an int or a double, is_float says which field to use
+struct num {
+    int is_float;
+    long long i;
+    double f;
+};
+
 struct token {
     int kind;
     size_t start;   // 0 based index into the file text
-    long long val;
+    struct num val;
 };
 
 static const char *src;     // the whole file, with one extra \n after the end
@@ -34,6 +42,9 @@ static size_t err_pos;      // 1 based, 0 means no error yet
 
 static char *out;
 static size_t out_len, out_cap;
+
+static char *numbuf;        // scratch copy of a float token for strtod
+static size_t numcap;
 
 // reads the whole file into one malloc'd buffer, returns NULL if it can't be opened
 static char *read_file(const char *path, size_t *len)
@@ -86,6 +97,51 @@ static void fail(size_t at)
         err_pos = at + 1;
 }
 
+// strtod needs a \0 at the end of the number and the file text has none there,
+// so copy the token into a scratch buffer. it is reused, so no malloc per number.
+// I can't just call strtod on src directly, it would swallow the e in 1.5e3
+static struct num to_float(size_t from, size_t to)
+{
+    size_t n = to - from;
+    if (n + 1 > numcap) {
+        numcap = n + 1;
+        numbuf = realloc(numbuf, numcap);
+        if (numbuf == NULL)
+            exit(1);
+    }
+    memcpy(numbuf, src + from, n);
+    numbuf[n] = '\0';
+
+    struct num r;
+    r.is_float = 1;
+    r.i = 0;
+    r.f = strtod(numbuf, NULL);
+    return r;
+}
+
+static double as_double(struct num n)
+{
+    return n.is_float ? n.f : (double)n.i;
+}
+
+static struct num make_float(double f)
+{
+    struct num r;
+    r.is_float = 1;
+    r.i = 0;
+    r.f = f;
+    return r;
+}
+
+static struct num make_int(long long i)
+{
+    struct num r;
+    r.is_float = 0;
+    r.i = i;
+    r.f = 0;
+    return r;
+}
+
 // scan counts every char of the file from 0, including the \n at the end of
 // each line, and it is never reset when a new line starts. so start + 1 is
 // already the position the task wants (1 based, \n counted)
@@ -101,15 +157,30 @@ static void next_token(void)
         cur.kind = T_EOL;
         return;
     }
-    scan++;
     if (c >= '0' && c <= '9') {
         cur.kind = T_NUM;
-        cur.val = c - '0';
-        while (src[scan] >= '0' && src[scan] <= '9') {
-            cur.val = cur.val * 10 + (src[scan] - '0');
+        while (src[scan] >= '0' && src[scan] <= '9')
             scan++;
+        // it is only a float when there are digits on both sides of the dot.
+        // so 5. and .5 never become floats here, the 5 (or nothing) is a number
+        // and the leftover . is a bad char token on the next call, which puts
+        // the error at the dot. same for the e in 1.5e3
+        if (src[scan] == '.' && src[scan + 1] >= '0' && src[scan + 1] <= '9') {
+            scan++;
+            while (src[scan] >= '0' && src[scan] <= '9')
+                scan++;
+            cur.val = to_float(cur.start, scan);
+        } else {
+            cur.val.is_float = 0;
+            cur.val.i = 0;
+            for (size_t k = cur.start; k < scan; k++)
+                cur.val.i = cur.val.i * 10 + (src[k] - '0');
         }
-    } else if (c == '+') {
+        return;
+    }
+
+    scan++;
+    if (c == '+') {
         cur.kind = T_PLUS;
     } else if (c == '-') {
         cur.kind = T_MINUS;
@@ -133,11 +204,11 @@ static void next_token(void)
     }
 }
 
-static long long expr(void);
+static struct num expr(void);
 
-static long long primary(void)
+static struct num primary(void)
 {
-    long long v = 0;
+    struct num v = make_int(0);
     if (cur.kind == T_NUM) {
         v = cur.val;
         next_token();
@@ -165,62 +236,98 @@ static long long primary(void)
     return v;
 }
 
+// int or float? every operation looks at both operands. if either one is a
+// float the whole thing is done in double, otherwise it stays long long math.
+// that is why 7 / 2 is 3 but 7 / 2.0 is 3.5. a float never goes back to int
+//
+// for float results the check is the same everywhere: if the answer is inf or
+// nan the operator is blamed, because the operator is what blew it up (the
+// operands were fine, 10.0 and 400 are both ok on their own)
+
 // power := primary [ '**' power ]
 // no loop here on purpose. after the ** this calls power() again for the
 // exponent, so 2 ** 3 ** 2 groups as 2 ** (3 ** 2) = 512. a loop like in expr
 // would group it to the left, (2 ** 3) ** 2 = 64, which is wrong
-static long long power(void)
+static struct num power(void)
 {
-    long long base = primary();
+    struct num base = primary();
     if (err_pos || cur.kind != T_POW)
         return base;
 
+    size_t op_at = cur.start;
     next_token();
     size_t exp_at = cur.start;
-    long long e = power();
+    struct num e = power();
     if (err_pos)
         return base;
-    if (e < 0) {
-        // the exponent is what's wrong, so point at the start of it (saved
-        // before the call, same reason as the division by zero below)
+
+    if (base.is_float || e.is_float) {
+        // pow() gives nan for stuff like (0 - 8) ** 0.5 and inf when it gets
+        // too big, both land on the operator
+        double r = pow(as_double(base), as_double(e));
+        if (!isfinite(r)) {
+            fail(op_at);
+            return base;
+        }
+        return make_float(r);
+    }
+
+    if (e.i < 0) {
+        // two ints and a negative exponent. the exponent is what's wrong, so
+        // point at the start of it (saved before the call, because by now cur
+        // has moved on to whatever comes after the exponent)
         fail(exp_at);
-        return 0;
+        return base;
     }
 
     // square and multiply. the b *= b is skipped on the last round so it
     // can't overflow for no reason
+    long long b = base.i;
+    long long n = e.i;
     long long r = 1;
-    while (e > 0) {
-        if (e & 1)
-            r *= base;
-        e >>= 1;
-        if (e > 0)
-            base *= base;
+    while (n > 0) {
+        if (n & 1)
+            r *= b;
+        n >>= 1;
+        if (n > 0)
+            b *= b;
     }
-    return r;
+    return make_int(r);
 }
 
 // term := power { ('*' | '/') power }
 // same loop trick as expr below, so 8 / 4 / 2 is (8 / 4) / 2
-static long long term(void)
+static struct num term(void)
 {
-    long long lhs = power();
+    struct num lhs = power();
     while (!err_pos && (cur.kind == T_STAR || cur.kind == T_SLASH)) {
         int op = cur.kind;
+        size_t op_at = cur.start;
         next_token();
         size_t rhs_at = cur.start;
-        long long rhs = power();
+        struct num rhs = power();
         if (err_pos)
             break;
-        if (op == T_STAR) {
-            lhs *= rhs;
-        } else if (rhs == 0) {
+
+        int is_float = lhs.is_float || rhs.is_float;
+        if (op == T_SLASH && (is_float ? as_double(rhs) == 0.0 : rhs.i == 0)) {
             // the 0 is the problem, not the slash, so point at where the right
-            // operand starts. rhs_at has to be saved before primary() because
-            // by then cur has moved on to the next token
+            // operand starts. rhs_at is saved before parsing it because by the
+            // time we get here cur has moved on to the next token
             fail(rhs_at);
+            break;
+        }
+
+        if (is_float) {
+            double a = as_double(lhs);
+            double b = as_double(rhs);
+            lhs = make_float(op == T_STAR ? a * b : a / b);
+            if (!isfinite(lhs.f))
+                fail(op_at);
+        } else if (op == T_STAR) {
+            lhs = make_int(lhs.i * rhs.i);
         } else {
-            lhs /= rhs;     // C already truncates toward zero, which is what we need
+            lhs = make_int(lhs.i / rhs.i);  // C already truncates toward zero, which is what we need
         }
     }
     return lhs;
@@ -231,17 +338,28 @@ static long long term(void)
 // the results of the level under it, so ** is glued together first, then * and /,
 // and + and - get what is left. that is the whole reason for the precedence.
 // 3 + 2 * 5 is 3 + (2 * 5)
-static long long expr(void)
+static struct num expr(void)
 {
-    long long lhs = term();
+    struct num lhs = term();
     while (!err_pos && (cur.kind == T_PLUS || cur.kind == T_MINUS)) {
         int op = cur.kind;
+        size_t op_at = cur.start;
         next_token();
-        long long rhs = term();
-        if (op == T_PLUS)
-            lhs += rhs;
-        else
-            lhs -= rhs;
+        struct num rhs = term();
+        if (err_pos)
+            break;
+
+        if (lhs.is_float || rhs.is_float) {
+            double a = as_double(lhs);
+            double b = as_double(rhs);
+            lhs = make_float(op == T_PLUS ? a + b : a - b);
+            if (!isfinite(lhs.f))
+                fail(op_at);
+        } else if (op == T_PLUS) {
+            lhs = make_int(lhs.i + rhs.i);
+        } else {
+            lhs = make_int(lhs.i - rhs.i);
+        }
     }
     return lhs;
 }
@@ -267,7 +385,7 @@ static void run(void)
         }
 
         next_token();
-        long long v = expr();
+        struct num v = expr();
         // expr stopped on something that isn't an operator, so this is leftover
         // junk like a bad char after a complete number. blame that token.
         // an extra ) also ends up here, nothing was open for it so primary never
@@ -277,8 +395,12 @@ static void run(void)
         if (err_pos)
             return;
 
-        char tmp[32];
-        int n = snprintf(tmp, sizeof tmp, "%lld\n", v);
+        char tmp[64];
+        int n;
+        if (v.is_float)
+            n = snprintf(tmp, sizeof tmp, "%.15g\n", v.f);
+        else
+            n = snprintf(tmp, sizeof tmp, "%lld\n", v.i);
         out_add(tmp, n);
         line = cur.start + 1;   // cur is the \n here, next line starts after it
     }
@@ -457,5 +579,6 @@ int main(int argc, char **argv)
     }
 
     free(out);
+    free(numbuf);
     return rc;
 }
